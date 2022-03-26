@@ -1,19 +1,28 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
+	"log"
+	"os"
+	"reflect"
+	"strconv"
 	"sync"
 )
 
 type Data struct {
-	val int
+	x_lock X_Lock
+	s_lock S_Lock
+	val    int
 }
 type User struct { //include authenticity level and user_id
-	busy bool
-	Id   int
+	status int //1 == free,2 == busy(wait for fin), 3 == block
+	Id     int
+	T      []Transaction
 }
 type DataTable struct {
+	mu       sync.Mutex
 	DataList []Data
 	TableId  int
 }
@@ -24,71 +33,72 @@ const (
 	Table_level = 3
 )
 
+type Transaction struct {
+	activity string
+	val      int
+	line     int
+	table    int
+}
+
+//line level
 type X_Lock struct {
-	level  int // 1==line_level,2==page_level,3==table_level
-	usr_id int
-	line   int
-	table  int
+	usr_id  int
+	t_queue []int
 }
 type S_Lock struct {
-	level  int
-	usr_id int
-	line   int
-	table  int
-}
-type LockTable struct {
-	mu       sync.Mutex
-	XL_Table []X_Lock
-	SL_Table []S_Lock
+	usr_id  []int
+	t_queue []int
 }
 
-func (usr *User) writeData(val int, t *DataTable, lock_table *LockTable, finished chan bool) bool {
+var isready chan int
+
+func (usr *User) writeData(val int, t *DataTable, finished chan bool) bool {
+	usr.status = 2
 
 	//lock_table.mu.Lock()
-
-	t.DataList = append(t.DataList, Data{val})
-
-	lock_table.XL_Table = append(lock_table.XL_Table, X_Lock{1, usr.Id, len(t.DataList), t.TableId})
+	t.DataList = append(t.DataList, Data{X_Lock{}, S_Lock{}, val})
+	usr.addLock(true, len(t.DataList)-1, t)
 
 	fmt.Println("lock!")
 	//defer lock_table.mu.Unlock()
 
 	//finish
-	finished <- true
+	fin := <-finished
+
+	usr.deleteLock(true, len(t.DataList)-1, t)
+
 	fmt.Println("Unlock!")
 
-	return true
+	usr.status = 1
+	return fin
 
 }
 
-func (usr *User) editData(val, line, table int, lock_table *LockTable, t *DataTable, finished chan bool) bool {
-	lock_table.mu.Lock()
-	for n, i := range lock_table.XL_Table {
-		for i.table == table && line == i.line && i.usr_id != usr.Id {
-			fmt.Println("mutex in X_Lock:line ", n)
-			defer lock_table.mu.Unlock()
-			return false
-		}
+func (usr *User) editData(val, line, table int, t *DataTable, finished chan bool) bool {
+	usr.status = 2
+	//lock_table.mu.Lock()
+
+	if !usr.checkLock(true, line, t) {
+		usr.status = 3
+		return false
 	}
 
-	for n, i := range lock_table.SL_Table {
-		for i.table == table && line == i.line && i.usr_id != usr.Id {
-			fmt.Println("mutex in S_Lock:line ", n)
-			defer lock_table.mu.Unlock()
-			return false
-		}
-	}
+	t.mu.Lock()
+	t.DataList[line] = Data{X_Lock{}, S_Lock{}, val}
+	usr.addLock(true, line, t)
+	t.mu.Unlock()
 
-	l_tmp := X_Lock{1, usr.Id, line, table}
-	lock_table.XL_Table = append(lock_table.XL_Table, l_tmp)
-	t.DataList[line] = Data{val}
-	defer lock_table.mu.Unlock()
+	//defer lock_table.mu.Unlock()
 
 	fin := <-finished //block
+
+	usr.deleteLock(true, line, t)
+	usr.status = 1
 	return fin
 }
 
-func (t *DataTable) deleteData(line int) bool {
+func (usr *User) deleteData(line int, t *DataTable) bool {
+	usr.status = 2
 
 	if line < 0 || line > cap(t.DataList) {
 		fmt.Println("Warming: Invalid:line", line)
@@ -98,111 +108,240 @@ func (t *DataTable) deleteData(line int) bool {
 	tmpList := t.DataList[:line-1]
 	tmpList2 := t.DataList[line:]
 	t.DataList = append(tmpList, tmpList2...)
+	usr.status = 1
 
 	return true
 }
 
-func (usr *User) readData(line, table int, lock_table *LockTable, t *DataTable) bool {
+func (usr *User) readData(line, table int, t *DataTable, finished chan bool) bool {
+	line -= 1
 	//mutex for read LockTable
+	usr.status = 2
 
-	//lock_table.mu.Lock()
-	for n, i := range lock_table.XL_Table {
-		for i.table == table && line == i.line && i.usr_id != usr.Id {
-			fmt.Println("mutex in X_Lock:line ", n+1, " table: ", table)
-			//defer lock_table.mu.Unlock()
-			return false
-		}
-
+	if !usr.checkLock(false, line, t) {
+		usr.status = 3
+		return false
 	}
+	usr.addLock(false, line, t)
+	val := t.DataList[line].val
 
-	fmt.Println("data:  ", t.DataList[line-1])
-	//defer lock_table.mu.Unlock()
+	fin := <-finished //block
 
-	return true
-}
+	usr.deleteLock(false, line, t)
 
-func printLockTable(lock_table LockTable) {
-	fmt.Println("show X_LOCK:", "\r")
-	for _, i := range lock_table.XL_Table {
-		fmt.Println("user_id:", i.usr_id, "  table:", i.table, " line:", i.line, "\r")
-	}
-
-	fmt.Println("\r", "show S_LOCK:", "\r")
-	for _, i := range lock_table.SL_Table {
-		fmt.Println("user_id:", i.usr_id, "  table:", i.table, " line:", i.line)
-	}
+	fmt.Println("user:", usr.Id, " read data:  ", val)
+	usr.status = 1
+	return fin
 }
 
 func Controller() {
 	//1. initial
 
+	isready = make(chan int)
 	Finished := [3]chan bool{
 		make(chan bool),
 		make(chan bool),
 		make(chan bool),
 	}
-	Usr_list := []User{{false, 0}, {false, 1}, {false, 2}}
-	var lock_table LockTable
-	t := []DataTable{{[]Data{}, 0}, {[]Data{}, 1}, {[]Data{}, 2}}
 
-	fmt.Println(len(t))
+	Usr_list := []User{{2, 0, scanText("t1.txt")}, {2, 1, scanText("t2.txt")}, {2, 2, scanText("t3.txt")}}
+	t := []DataTable{{sync.Mutex{}, []Data{}, 0}, {sync.Mutex{}, []Data{}, 1}, {sync.Mutex{}, []Data{}, 2}}
+	fmt.Println("start DBS")
+
+	for usr := range Usr_list { //start coroutine,each coroutine represents 1 user
+		go Usr_list[usr].run(Finished[usr], &t)
+	}
+
+	go ready(Finished)
+
 	for {
-		var usr int
-		var inst string
-		_, err := fmt.Scan(&usr) //input user
+		//time.Sleep((time.Second * 1))
 
-		if err == io.EOF || usr == -1 {
+		var fin_usr int
+
+		_, err := fmt.Scan(&fin_usr)
+		if err == io.EOF || fin_usr == -1 {
 			break
 		}
 
-		if Usr_list[usr].busy { //detect whether the user is free
-			fmt.Println("User ", usr, " is busy")
-			continue
-		}
-
-		if usr >= 3 {
-			fmt.Println("invalid usr")
-			continue
-		}
-
-		_, err = fmt.Scan(&inst) //input insructions
-
-		if err == io.EOF {
+		if fin_usr > 2 || fin_usr < 0 {
+			fmt.Println("Error: User ", fin_usr, " does not exist")
 			break
 		}
 
-		var val int
-		var d int
-		var ind_of_tb int
-		switch inst {
-
-		case "fin":
-			fin := <-Finished[usr]
-			fmt.Println(fin)
-
-		case "append":
-			fmt.Println("input data & index of DataTable", "\r")
-			fmt.Scan(&d, &ind_of_tb)
-			go Usr_list[usr].writeData(d, &t[ind_of_tb], &lock_table, Finished[usr])
-
-		case "read":
-			fmt.Println("input line & index of DataTable")
-			fmt.Scan(&d, &ind_of_tb)
-			go Usr_list[usr].readData(d, ind_of_tb, &lock_table, &t[ind_of_tb])
-
-		case "edit":
-			fmt.Println("input var & line & index of DataTable")
-			fmt.Scan(&val, &d, &ind_of_tb)
-			go Usr_list[usr].editData(val, d, ind_of_tb, &lock_table, &t[ind_of_tb], Finished[usr])
-
-		case "printLock":
-			fmt.Println("print lock")
-			go printLockTable(lock_table)
-
+		switch Usr_list[fin_usr].status {
+		case 1:
+			fmt.Println("Error: User ", fin_usr, " is free")
+		case 2:
+			Finished[fin_usr] <- true
+			fmt.Println("Finish ->: ", fin_usr)
+		case 3:
+			fmt.Println("Error: User ", fin_usr, " is block")
 		default:
-			fmt.Println("invalid instruction")
+			fmt.Println("status 0")
+		}
+	}
+
+}
+
+func ready(fin [3]chan bool) {
+	id := <-isready
+	fmt.Println("ready <- ", id)
+	fin[id] <- true
+
+}
+func scanText(filename string) []Transaction {
+	var t []Transaction
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+
+	for {
+		var temp_t Transaction
+
+		s, err := reader.ReadString(' ')
+		if err == nil {
+			switch s {
+			case "append ":
+				temp_t.activity = "append"
+
+			case "edit ":
+				temp_t.activity = "edit"
+
+			case "read ":
+				temp_t.activity = "read"
+			}
+		} else if err == io.EOF {
+			break
+		} else {
+			fmt.Println("error in scan text")
 		}
 
+		s, err = reader.ReadString(' ')
+		s = s[0 : len(s)-1]
+		if err == nil {
+			temp_t.val, _ = strconv.Atoi(s)
+		}
+
+		s, err = reader.ReadString(' ')
+		s = s[0 : len(s)-1]
+		if err == nil {
+			temp_t.line, _ = strconv.Atoi(s)
+		}
+
+		s, err = reader.ReadString('\n')
+		s = s[0 : len(s)-1]
+		if err == nil {
+			temp_t.table, _ = strconv.Atoi(s)
+		}
+		t = append(t, temp_t)
+
+	}
+
+	return t
+
+}
+
+func (usr *User) run(fin chan bool, t *[]DataTable) bool {
+	finished := <-fin
+	fmt.Println("User ", usr.Id, " start running")
+	for len(usr.T) != 0 {
+		if usr.status != 3 {
+			inst := usr.T[0].activity
+			val := usr.T[0].val
+			d := usr.T[0].line
+			ind_of_tb := usr.T[0].table
+
+			var taskover bool
+			switch inst {
+			case "append":
+				taskover = usr.writeData(d, &((*t)[ind_of_tb]), fin)
+
+			case "read":
+				taskover = usr.readData(d, ind_of_tb, &((*t)[ind_of_tb]), fin)
+
+			case "edit":
+				taskover = usr.editData(val, d, ind_of_tb, &((*t)[ind_of_tb]), fin)
+
+			}
+
+			if taskover {
+				usr.T = usr.T[1:len(usr.T)]
+			}
+
+			//time.Sleep(1 * time.Second)
+		} else {
+			s := <-fin
+			fmt.Println(s)
+			usr.status = 1
+		}
+	}
+
+	fmt.Println("user: ", usr.Id, " done!")
+	return finished
+}
+func (usr *User) addLock(isedit bool, line int, t *DataTable) {
+
+	if !isedit {
+		t.DataList[line].s_lock.usr_id = append(t.DataList[line].s_lock.usr_id, usr.Id)
+	} else {
+		t.DataList[line].x_lock = X_Lock{usr.Id, []int{}}
+	}
+
+}
+
+func (usr *User) checkLock(isedit bool, line int, t *DataTable) bool {
+
+	if isedit {
+		if len(t.DataList[line].s_lock.usr_id) != 0 {
+			fmt.Println("block : s_lock")
+			t.DataList[line].s_lock.t_queue = append(t.DataList[line].s_lock.t_queue, usr.Id)
+			return false
+		}
+	}
+
+	if !reflect.DeepEqual(t.DataList[line].x_lock, X_Lock{}) {
+		fmt.Println("block:x_lock")
+		t.DataList[line].x_lock.t_queue = append(t.DataList[line].x_lock.t_queue, usr.Id)
+		return false
+	}
+
+	return true
+}
+
+func (usr *User) deleteLock(isedit bool, line int, t *DataTable) {
+
+	if !isedit {
+
+		for i, s_lock := range t.DataList[line].s_lock.usr_id {
+			if s_lock == usr.Id {
+				t.DataList[line].s_lock.usr_id = append(t.DataList[line].s_lock.usr_id[0:i], t.DataList[line].s_lock.usr_id[i+1:]...)
+
+				if len(t.DataList[line].s_lock.t_queue) > 0 {
+					ready_tmp := t.DataList[line].s_lock.t_queue[0]
+					defer func() {
+						isready <- ready_tmp
+					}()
+
+					t.DataList[line].s_lock.t_queue = t.DataList[line].s_lock.t_queue[1:]
+
+				}
+			}
+		}
+
+	} else {
+		if len(t.DataList[line].x_lock.t_queue) > 0 {
+			ready_tmp := t.DataList[line].x_lock.t_queue[0]
+			defer func() {
+				isready <- ready_tmp
+			}()
+		}
+		fmt.Println("delete x_lock")
+		t.DataList[line].x_lock = X_Lock{}
 	}
 }
 
