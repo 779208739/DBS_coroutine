@@ -1,2 +1,0 @@
-append 1 1 1
-read 1 1 1
